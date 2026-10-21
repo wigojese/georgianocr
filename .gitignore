@@ -1,0 +1,5 @@
+pdf_files/
+extracted_texts/
+*.pdf
+__pycache__/
+*.part
