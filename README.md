@@ -6,17 +6,16 @@ OCR for scanned Georgian newspapers and journals from the 1910s–1920s (PDF →
 
 ## Results
 
-The test pages are *Guriis Erobis Moambe* 1920 №1 p.1 (clean) and №6 p.2 (dark, low contrast). Each was scored against a hand-typed transcription in `ground_truth/` using `evaluate.py`.
+Scored with `evaluate.py` against the hand-typed passages in `ground_truth/`:
 
-|                         | CER (characters) | WER (words) |
-|-------------------------|-----------------:|------------:|
-| legacy simple (psm 3)   | 7.4 %            | 42.7 %      |
-| legacy v2               | 46.6 %           | 74.1 %      |
-| legacy v4               | 48.5 %           | 74.6 %      |
-| legacy v5               | 35.6 %           | 68.5 %      |
-| **v6**                  | **1.2 %**        | **9.1 %**   |
+| page | legacy simple (psm 3) | legacy v5 | **v6** |
+|---|---|---|---|
+| Guriis Erobis Moambe 1920 №1 p.1 (clean) | 9.5 % / 50.8 % | 37.9 % / 74.6 % | **1.7 % / 12.7 %** |
+| Guriis Erobis Moambe 1920 №6 p.2 (dark) | 4.6 % / 31.6 % | 32.6 % / 60.2 % | **0.4 % / 3.1 %** |
+| Sakartvelos Respublika 1920 №298 p.3 (broadsheet, high-res) | 31.7 % / 43.1 % | 64.5 % / 84.3 % | **2.4 % / 19.6 %** |
+| Sakartvelos Respublika 1921 №1 p.3 (broadsheet, low-res) | 6.4 % / 46.7 % | 5.6 % / 43.3 % | **3.2 % / 30.0 %** |
 
-The ground truth is still small (about 2,000 characters). Adding more pages makes these numbers more reliable (see below).
+Each cell is CER / WER: the share of characters / words that are wrong. The ground truth is small (about 2,500 characters), so add more pages to make these numbers more reliable (see below).
 
 ## What v6 does differently, and why
 
@@ -24,7 +23,7 @@ The ground truth is still small (about 2,000 characters). Adding more pages make
    - It cuts only at real rules (long, thin lines) and at white gutters that run the full height of a region.
    - Where a gutter is blocked by something spanning several columns (the masthead, a wide heading), it cuts horizontally just above and below that element.
    - A typical page comes out as header + 2 columns. Each column is read by Tesseract as a whole, so headings stay attached to their text.
-2. **Native resolution.** On these scans upscaling made recognition worse. Pages are resized only if the line pitch is outside 18–48 px.
+2. **Native resolution.** On these scans upscaling made recognition worse. Pages are resized only if the line pitch is outside 18–72 px.
 3. **Three image variants per line.** Each block is read three ways: normalised grey, Sauvola binary, and grey upscaled ×1.5. For each line the best reading is kept, scored by confidence plus the share of words found in the lexicon.
 4. **Fake punctuation removed.** Tesseract invents line-end periods and turns paper specks into `.` or `„`. Every trailing `. , : ;`, every quote, and every leading quote is checked against the pixels. A real period is a small blob at the baseline; a real quote is two marks or one large one. A hyphen-shaped mark that was read as `.` or `“` is turned back into `-`.
 5. **Words broken across lines.** All line geometry is kept until the end. A line-end fragment is joined with the start of the next line when:
@@ -35,7 +34,8 @@ The ground truth is still small (about 2,000 characters). Adding more pages make
 
    The lexicon is `georgian_words.txt`: 197k word forms taken from Tesseract's `kat` model. Words that occur at least 3 times in your existing outputs are added to it, which picks up 1920s spellings such as `ერთიანათ` and `იმდენათ`.
 6. **Low-confidence text is kept.** Only decorative masthead lettering and isolated junk lines (stamps, ornaments) are dropped. The running page header is removed by default.
-7. **Paragraphs and headings.** Paragraphs are detected from indentation and short last lines. Headings are detected by larger letter height or centring, and appear as their own paragraph (`--mark-headings` prefixes them with `## `).
+7. **Decorative frames are ignored.** Ornamental borders and bands (crosses, checkerboards, flowers…) are found as long, narrow strips whose pattern repeats along their length. Ordinary text, including spaced-out display headings, does not repeat like that. The frame is erased before OCR and acts as a block boundary. Text inside a small framed box (an ad, a notice) is output as **one paragraph** (`--frame-paragraphs` keeps its normal paragraphs). Plain line frames are handled like column rules.
+8. **Paragraphs and headings.** Paragraphs are detected from indentation and short last lines. Headings are detected by larger letter height or centring, and appear as their own paragraph (`--mark-headings` prefixes them with `## `).
 
 ## Installation
 
@@ -58,15 +58,19 @@ Useful options:
 
 | option | effect |
 |---|---|
-| `--debug` | saves `extracted_texts/_debug/*.jpg` showing blocks (red, numbered in reading order), lines (blue), rules (green) and page headers (grey) |
+| `--debug` | saves `extracted_texts/_debug/*.jpg` showing blocks (red, numbered in reading order), framed blocks (magenta), lines (blue), rules and frames (green) and page headers (grey) |
 | `--fast` | one image variant instead of three |
 | `--keep-headers` | keep the running header line (newspaper name, page number) |
 | `--mark-headings` | prefix headings with `## ` |
 | `--lines` | keep the original line breaks (no paragraph joining or de-hyphenation) |
+| `--split-pages` | also write each page to its own file: `extracted_texts/<pdf>/<pdf>_p001.txt` |
+| `--frame-paragraphs` | text inside decorative frames keeps its paragraphs instead of becoming one paragraph |
 | `--lang kat+rus` | Georgian text with Russian inserts |
 | `--workers N` | number of pages processed in parallel |
 
-Speed: about 12 s per page per CPU core in the default (best) mode. 68 pages took 3.5 minutes on 4 cores.
+Output is always split by page: each page starts with `===== გვერდი N =====`. Paragraphs never run across pages. When a word is hyphenated across a page break, its second half moves to the end of the earlier page.
+
+Speed: about 12 s per journal page per CPU core in the default (best) mode, and about 25–40 s per broadsheet page. 68 journal pages took 3.5 minutes on 4 cores.
 
 ## Measuring quality: `evaluate.py`
 
@@ -85,4 +89,5 @@ Use this before and after every change. Without it, tuning is guesswork, and eac
 - **Bold and decorative type** is the weakest point. The bold quotation on N1 p.1 and the bold decisions page N6 p.5 have most of the remaining errors. The stock `kat` model was trained on modern fonts.
 - **Fine-tuning `kat` on these newspapers** is the next big step. Use [tesstrain](https://github.com/tesseract-ocr/tesstrain) with a few hundred corrected text lines (line image + transcription). `--debug` and the line boxes give you the line crops, and correcting v6 output is much faster than typing from scratch.
 - **Mastheads and date bars** in decorative fonts come out garbled or are dropped.
-- **4-column newspapers** (e.g. *Sakartvelos Respublika*): only the debug overlays of those pages were available for testing, not the PDFs. Run a few pages with `--debug` and check the block layout.
+- **Tables** (e.g. tariff tables with dotted leaders) are read column by column: all the item names, then all the prices.
+- **Line spacing and resolution.** Scans whose line spacing falls between 18 and 72 px are processed at native resolution. Others are rescaled to 28 px line spacing. The spacing estimate is checked against letter height, so ornaments and sparse poems no longer distort it.

@@ -56,13 +56,18 @@ QUALITY = "best"
 # სტრიქონის ბიჯი (ერთი სტრიქონის ფუძიდან მეორემდე) პიქსელებში. თუ სკანზე ბიჯი ამ
 # საზღვრებშია, სურათი არ იცვლება; თუ არა - მოერგება TARGET_LINE_PITCH-ს.
 MIN_LINE_PITCH = 18
-MAX_LINE_PITCH = 48
+MAX_LINE_PITCH = 72
 TARGET_LINE_PITCH = 28
 
 # გვერდის ზედა სტრიქონი (გაზეთის სახელი, გვერდის ნომერი, თარიღი) - ტექსტში არ გავიდეს
 DROP_PAGE_HEADERS = True
+# დეკორატიულ ჩარჩოში ჩასმული ტექსტი (განცხადება) ერთ აბზაცად გამოვიდეს
+FRAME_AS_ONE_TEXT = True
 # სათაურებს "## "-ით აღნიშნავს
 MARK_HEADINGS = False
+# თითოეული გვერდი ცალკე ფაილადაც: extracted_texts/<PDF-ის სახელი>/<სახელი>_p001.txt
+# (საერთო TXT-შიც გვერდები "===== გვერდი N =====" ხაზით არის გაყოფილი)
+SPLIT_PAGES = False
 # თითოეული სტრიქონი ცალკე (აბზაცებად გაერთიანების და დეფისების აღდგენის გარეშე)
 KEEP_LINES = False
 
@@ -194,11 +199,28 @@ def rotate(img, angle, border):
     return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC, borderValue=border)
 
 
+def char_height(ink):
+    """ასოების მედიანური სიმაღლე (ლაქები და დიდი ობიექტები გარეთ)."""
+    _, _, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    h, w, a = st[1:, 3], st[1:, 2], st[1:, 4]
+    m = (h >= 4) & (h <= ink.shape[0] / 25) & (a >= 10) & (w <= 3 * h)
+    if m.sum() < 50:
+        return 0.0
+    m &= h >= 0.35 * np.percentile(h[m], 90)
+    return float(np.median(h[m]))
+
+
 def prepare(gray):
     """აბრუნებს (norm, ink, P): გასწორებულ ნაცრისფერ სურათს, მელნის ნიღაბს, სტრიქონის ბიჯს."""
     norm = normalize(gray)
     ink = sauvola(norm, 41)
-    P = line_pitch(ink) or 30.0
+    P = line_pitch(ink)
+    ch = char_height(ink)
+    # სტრიქონის ბიჯი ჩვეულებრივ ასოს სიმაღლის 1.6-1.8-ჯერადია. თუ ასე არ არის, ბიჯი
+    # სხვა რამემ "აჩვენა" (ჩარჩოს ორნამენტი, ცხრილი, ლექსის იშვიათი სტრიქონები)
+    if ch and (not P or not 1.2 <= P / ch <= 2.6):
+        P = 1.75 * ch
+    P = P or 30.0
     if not MIN_LINE_PITCH <= P <= MAX_LINE_PITCH:
         scale = TARGET_LINE_PITCH / P
         scale = min(scale, (MAX_PIXELS / (gray.shape[0] * gray.shape[1])) ** 0.5)
@@ -254,7 +276,7 @@ class Layout:
     def __init__(self, mask, vr, hr, P):
         self.mask, self.hr, self.P = mask, hr, P
         # ოდნავ დახრილი/მრუდე ხაზი ერთ პიქსელურ სვეტში მთლიანად არ ჯდება - ვაგანიერებთ
-        k = max(3, int(0.4 * P)) | 1
+        k = max(3, int(1.0 * P)) | 1
         self.vr = cv2.dilate(vr, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
         self.leaves = []
 
@@ -300,8 +322,19 @@ class Layout:
         for a, b in _runs(cov >= 0.8 * h):
             c = x0 + (a + b) // 2
             if c - x0 > 2 * self.P and x1 - c > 2 * self.P:
-                cuts.append(c)
+                # ხაზის გაგრძელებაზე ტექსტი არ უნდა გადადიოდეს (მაგ. გაზეთის სახელი ზემოთ)
+                if self.crossing(x0, y0, x1, y1, c) <= max(3, 0.02 * h):
+                    cuts.append(c)
         return cuts
+
+    def crossing(self, x0, y0, x1, y1, c):
+        """რამდენი სტრიქონის სიმაღლის მელანი გადადის c-ზე ორივე მხარეს (არა უბრალოდ ეხება)."""
+        d = int(0.3 * self.P)
+        a, b = max(x0, c - 4 * d), min(x1, c + 4 * d)
+        n, _, st, _ = cv2.connectedComponentsWithStats(self.mask[y0:y1, a:b], connectivity=8)
+        cx0, cx1 = st[1:, 0] + a, st[1:, 0] + st[1:, 2] + a
+        hit = (cx0 < c - d) & (cx1 > c + d)
+        return int(st[1:, 3][hit].sum())
 
     def rule_hcuts(self, x0, y0, x1, y1):
         w = x1 - x0
@@ -319,8 +352,10 @@ class Layout:
         sub = self.mask[y0:y1, x0:x1] > 0
         h = y1 - y0
         ink = sub.sum(axis=0)
+        # ხაზი ნიღბიდან უკვე ამოღებულია: სვეტი ცარიელია მხოლოდ მაშინ, თუ ხაზის გარდა
+        # არაფერია (ხაზი, რომელიც მხოლოდ ქვემოთ იწყება, ზემოთ გადაჭიმულ ტექსტს არ ჭრის)
         vcov = (self.vr[y0:y1, x0:x1] > 0).sum(axis=0) >= 0.5 * h
-        empty = (ink <= max(1, tol_frac * h)) | vcov
+        empty = ink <= max(1, tol_frac * h)
         out = []
         for a, b in _runs(empty):
             if a == 0 or b == len(empty):
@@ -340,74 +375,158 @@ class Layout:
             min_w = 3.0 * P          # ერთი-ორი სტრიქონი: სიტყვებს შორის არ გაჭრას
         elif h < 8 * P:
             min_w = 1.6 * P
-        else:
+        elif h < 20 * P:
             min_w = 1.0 * P
+        else:
+            min_w = 0.4 * P          # 20+ სტრიქონზე უწყვეტი ვიწრო თეთრი არხი მხოლოდ სვეტებს შორისაა
         return self._gutters(x0, y0, x1, y1, 0.004, min_w)
 
     # --- 3) სვეტების გამყოფს ზოგან რაღაც კვეთს (რამდენიმე სვეტზე გადაჭიმული სათაური,
-    #        გაზეთის სახელი...) - ვჭრით ჰორიზონტალურად სწორედ იმ ადგილის ზემოთ/ქვემოთ
+    #        გაზეთის სახელი...). ვეძებთ გრძელ უწყვეტ თეთრ "არხს" (ბლოკის სიმაღლის ნახევარი
+    #        მაინც) და ვჭრით ჰორიზონტალურად იქ, სადაც არხი იწყება ან მთავრდება.
     def partial_hcuts(self, x0, y0, x1, y1):
         P = self.P
         h, w = y1 - y0, x1 - x0
         if h < 6 * P or w < 8 * P:
             return []
         sub = self.mask[y0:y1, x0:x1] > 0
-        vsub = self.vr[y0:y1, x0:x1] > 0
-        band = max(4, int(P))
+        band = max(4, int(P / 2))
         nb = h // band
-        if nb < 4:
+        if nb < 8:
             return []
-        gw = max(3, int(1.0 * P))
-        # თითოეულ ზოლში: რომელი სვეტებია ცარიელი
-        col_ink = sub[:nb * band].reshape(nb, band, w).sum(1)        # nb x w
-        rule = vsub[:nb * band].reshape(nb, band, w).any(1)
-        k = np.ones(gw)
-        win = np.stack([np.convolve(r, k, "same") for r in col_ink])   # ფანჯრის ჯამი
-        free = (win <= 1) | rule
-        frac = free.mean(0)
+        # ზოლი x-ზე თავისუფალია, თუ მელანი x-ის 3-პიქსელიან ვიწრო ზოლს არ კვეთს
+        cross = sub[:nb * band].reshape(nb, band, w).sum(1)              # nb x w
+        cross = np.stack([np.convolve(r, np.ones(3), "same") for r in cross])
+        free = cross <= 2
+        # ერთი ზოლის (ნახევარი სტრიქონის) წყვეტა - ლაქა ან დეფისი, არა სათაური
+        gap1 = ~free[1:-1] & free[:-2] & free[2:]
+        free[1:-1] |= gap1
         margin = int(3 * P)
         if w <= 2 * margin:
             return []
-        xs = np.arange(margin, w - margin)
-        x = int(xs[np.argmax(frac[margin:w - margin])])
-        if frac[x] < 0.55 or frac[x] >= 0.999:
+        # თითოეული x-ისთვის: ყველაზე გრძელი უწყვეტი თავისუფალი მონაკვეთი
+        best = None
+        for x in range(margin, w - margin, 2):
+            runs = _runs(free[:, x])
+            if not runs:
+                continue
+            a, b_ = max(runs, key=lambda r: r[1] - r[0])
+            L = b_ - a
+            if L < 0.35 * nb or L * band < 6 * P or L == nb:
+                continue
+            if best is None or L > best[0]:
+                best = (L, x, a, b_)
+        if best is None:
             return []
-        # ორივე მხარეს ტექსტი უნდა იყოს იმ ზოლებში, სადაც გამყოფი თავისუფალია
-        fb = free[:, x]
-        if sub[:nb * band][np.repeat(fb, band)][:, :x].sum() < 2 * P * P or \
-           sub[:nb * band][np.repeat(fb, band)][:, x:].sum() < 2 * P * P:
+        L, x, a, b_ = best
+        ya, yb = a * band, min(h, b_ * band)
+        # არხის ორივე მხარეს ტექსტი უნდა იყოს
+        if sub[ya:yb, :x].sum() < 2 * P * P or sub[ya:yb, x:].sum() < 2 * P * P:
             return []
-        blocked = _runs(~fb)
-        rowink = sub.sum(axis=1)
-        empty_row = rowink <= max(1, 0.003 * w)
+        empty_row = sub.sum(axis=1) <= max(1, 0.003 * w)
         cuts = []
-        for a, b in blocked:
-            ya, yb = a * band, min(h, b * band)
-            # უახლოესი ცარიელი სტრიქონი ზემოთ და ქვემოთ
-            up = np.where(empty_row[:ya])[0]
-            dn = np.where(empty_row[yb:])[0]
-            if a > 0 and len(up):
+        if a > 0:
+            up = np.where(empty_row[:ya + band])[0]
+            if len(up):
                 cuts.append(y0 + int(up[-1]))
-            if b < nb and len(dn):
-                cuts.append(y0 + yb + int(dn[0]))
-        cuts = sorted(set(c for c in cuts if y0 + 0.3 * P < c < y1 - 0.3 * P))
-        return cuts
+        if not cuts and b_ < nb:
+            dn = np.where(empty_row[max(0, yb - band):])[0]
+            if len(dn):
+                cuts.append(y0 + max(0, yb - band) + int(dn[0]))
+        return [c for c in cuts if y0 + 0.3 * P < c < y1 - 0.3 * P]
+
+
+def _periodicity(sub, P):
+    """რამდენად მეორდება ზოლი თავისი სიგრძის გასწვრივ (თითოეული სტრიქონის ავტოკორელაცია,
+    ჯამურად). ორნამენტი (ჯვრები, ჭადრაკი, ყვავილები) ~0.6-1.0, ტექსტი, მათ შორის
+    გაშლილი სათაურიც ("ს ა ზ ო გ ა დ ო ე ბ ა"), 0.6-ზე ნაკლები."""
+    a = sub.astype(np.float32)
+    a = a - a.mean(1, keepdims=True)
+    n = a.shape[1]
+    F = np.fft.rfft(a, 2 * n, axis=1)
+    ac = np.fft.irfft(F * np.conj(F), axis=1)[:, :n].sum(0)
+    if n < 6 * P or ac[0] <= 0:
+        return 0.0
+    ac /= ac[0]
+    lo, hi = max(3, int(0.25 * P)), min(n - 1, int(3 * P))
+    seg = ac[lo:hi]
+    peaks = [seg[i] for i in range(1, len(seg) - 1) if seg[i] >= seg[i - 1] and seg[i] >= seg[i + 1]]
+    return float(max(peaks)) if peaks else 0.0
+
+
+def find_frames(ink, P):
+    """დეკორატიული ჩარჩოები და ორნამენტული ზოლები (ჯვრები, ჭადრაკი, ყვავილები...).
+    ორნამენტის ელემენტებს ვაერთებთ, ვპოულობთ გრძელ ვიწრო ჰორიზონტალურ/ვერტიკალურ ზოლებს
+    და ვიტოვებთ მხოლოდ პერიოდულებს. აბრუნებს (frames, vsides, hsides): ჩარჩოს მელანი
+    (ტექსტიდან ამოსაშლელი) და მისი შუა ხაზები გამყოფებად - ჩარჩოში ჩასმული ტექსტი
+    ცალკე ბლოკი ხდება."""
+    frames = np.zeros_like(ink)
+    vs, hs = np.zeros_like(ink), np.zeros_like(ink)
+    k = max(3, int(0.5 * P)) | 1
+    closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    L = int(6 * P)
+    for axis, kern in ((0, (L, 1)), (1, (1, L))):
+        bars = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, kern))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(bars, connectivity=8)
+        for i in range(1, n):
+            x, y, w, h, a = st[i]
+            thick = h if axis == 0 else w
+            if thick > 2.0 * P or thick < 0.35 * P:
+                continue                        # სქელი = ტექსტის ბლოკი; წვრილი = ჩვეულებრივი ხაზი (find_rules)
+            sub = (ink[y:y + h, x:x + w] > 0) & (lab[y:y + h, x:x + w] == i)
+            if _periodicity(sub if axis == 0 else sub.T, P) < 0.6:
+                continue
+            frames[y:y + h, x:x + w][sub] = 255
+            if axis == 0:
+                hs[y + h // 2, x:x + w] = 255
+            else:
+                vs[y:y + h, x + w // 2] = 255
+    t3 = np.ones((3, 3), np.uint8)
+    return frames, cv2.dilate(vs, t3), cv2.dilate(hs, t3)
 
 
 def segment(ink, P):
-    vr, hr = find_rules(ink, P)
-    rules = cv2.dilate(vr | hr, np.ones((5, 5), np.uint8))
+    frames, fv, fh = find_frames(ink, P)
+    vr, hr = find_rules(cv2.bitwise_and(ink, cv2.bitwise_not(frames)), P)
+    vr, hr = vr | fv, hr | fh
+    ink = cv2.bitwise_and(ink, cv2.bitwise_not(cv2.dilate(frames, np.ones((3, 3), np.uint8))))
+    k = max(5, int(0.25 * P)) | 1          # ხაზის კიდეები (სქელი/დაკბილული) ტექსტად არ დარჩეს
+    rules = cv2.dilate(vr | hr, np.ones((k, k), np.uint8))
     mask = cv2.bitwise_and(ink, cv2.bitwise_not(rules))
     mask = remove_small(mask, max(4, int(0.012 * P * P)))
     # დიდი, თითქმის შავი ლაქები (სურათი, მელნის ლაქა) - ბლოკებს არ უნდა აერთებდეს
     n, labels, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     bw, bh, ar = st[:, 2], st[:, 3], st[:, 4]
     blot = (ar > 40 * P * P) & (ar > 0.6 * bw * bh)
+    # ფურცლის დახეული/მუქი კიდე: სკანის კიდეს ეხება და ასოზე დიდია
+    H, W = mask.shape
+    bx, by = st[:, 0], st[:, 1]
+    edge = (bx <= 2) | (by <= 2) | (bx + bw >= W - 2) | (by + bh >= H - 2)
+    blot |= edge & ((ar > 0.5 * P * P) | (bh > 1.5 * P) | (bw > 3 * P))
     blot[0] = False
     if blot.any():
         mask[blot[labels]] = 0
     leaves = Layout(mask, vr, hr, P).run()
-    return leaves, vr, hr, mask
+    return leaves, vr | frames, hr, mask, fv | fh
+
+
+def frame_cells(fsides, P):
+    """დეკორატიული ჩარჩოებით შემოსაზღვრული არეები (განცხადება, ცნობა). 0 = ჩარჩოს გარეთ.
+    გვერდის ზომის ჩარჩო (მთელ გვერდს რომ აკრავს) არ ითვლება."""
+    if not fsides.any():
+        return None
+    H, W = fsides.shape
+    k = max(3, int(0.6 * P)) | 1
+    free = (cv2.dilate(fsides, np.ones((k, k), np.uint8)) == 0).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(free, connectivity=4)
+    keep = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if x <= 0 or y <= 0 or x + w >= W or y + h >= H:
+            continue
+        if w * h <= 0.4 * W * H and w >= 3 * P and h >= 1.5 * P:
+            keep[i] = True
+    return np.where(keep[lab], lab, 0)
 
 
 # ---------------------------- OCR ----------------------------
@@ -512,16 +631,21 @@ def merge_variants(a, b):
     return out
 
 
-def ocr_block(norm, rules, box, P):
+def ocr_block(norm, rules, box, P, col_w=None):
     x0, y0, x1, y1 = box
     H, W = norm.shape
     m = 2
     x0, y0, x1, y1 = max(0, x0 - m), max(0, y0 - m), min(W, x1 + m), min(H, y1 + m)
     crop = norm[y0:y1, x0:x1].copy()
     crop[rules[y0:y1, x0:x1] > 0] = 255
-    psm = 7 if (y1 - y0) < 1.8 * P else 6
+    if (y1 - y0) < 1.8 * P:
+        psm = 7
+    elif col_w and (x1 - x0) > 1.6 * col_w and (y1 - y0) > 3 * P:
+        psm = 3          # სვეტზე ბევრად განიერი ბლოკი (სახელი + ცხრილი, განცხადება): შიგნით Tesseract-ი დაყოფს
+    else:
+        psm = 6
     lines = ocr_lines(crop, psm, x0, y0, 1.0)
-    if QUALITY == "best":
+    if QUALITY == "best" and psm != 3:          # psm 3-ში ვარიანტები სხვადასხვაგვარად იყოფა - არ ვურევთ
         # იგივე ბლოკი შავ-თეთრად და 1.5-ჯერ გადიდებული; თითოეული სტრიქონისთვის უკეთესი რჩება
         binv = 255 - remove_small(sauvola(crop, 1.6 * P), 3)
         lines = merge_variants(lines, ocr_lines(binv, psm, x0, y0, 1.0))
@@ -540,20 +664,26 @@ def process_page(args):
     gray = load_page(doc[pno])
     doc.close()
     norm, ink, P = prepare(gray)
-    leaves, vr, hr, mask = segment(ink, P)
+    leaves, vr, hr, mask, fsides = segment(ink, P)
     rules = cv2.dilate(vr | hr, np.ones((3, 3), np.uint8))
+    cells = frame_cells(fsides, P)
     H, W = norm.shape
+    # ტიპური სვეტის სიგანე: მაღალი (ტექსტით სავსე) ბლოკების მედიანა
+    tall = [b[2] - b[0] for b in leaves if b[3] - b[1] >= 10 * P]
+    col_w = float(np.median(tall)) if tall else None
     blocks = []
     for box in leaves:
         bw, bh = box[2] - box[0], box[3] - box[1]
         if bw < 1.0 * P or bh < 0.5 * P:
             continue
-        lines = ocr_block(norm, rules, box, P)
+        lines = ocr_block(norm, rules, box, P, col_w)
         lines = [l for l in lines if any(re.search(rf"[{GEO}0-9]", w[0]) for w in l["words"])]
         verify_marks(lines, ink, P)
         if not lines:
             continue
-        blocks.append(dict(box=tuple(int(v) for v in box), lines=lines))
+        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+        frame = int(cells[cy, cx]) if cells is not None else 0
+        blocks.append(dict(box=tuple(int(v) for v in box), lines=lines, frame=frame))
     drop_garbage(blocks)
     mark_headers(blocks, hr, P, H)
     if debug_dir:
@@ -745,8 +875,9 @@ def plausible_join(a, b, w, lex):
     return fw >= 2 and fw >= 0.05 * min(lex.f(a), lex.f(b))
 
 
-def split_paragraphs(block, P):
-    """ბლოკის სტრიქონები -> [(kind, [lines])], kind = 'head' | 'para'."""
+def split_paragraphs(block, P, page_h=None):
+    """ბლოკის სტრიქონები -> [(kind, [lines])], kind = 'head' | 'para'.
+    page_h - გვერდის ჩვეულებრივი ტექსტის ასოს სიმაღლე (პატარა ბლოკში საკუთარი მედიანა არასანდოა)."""
     lines = block["lines"]
     if not lines:
         return []
@@ -759,7 +890,7 @@ def split_paragraphs(block, P):
     for l in lines:
         wh = [w[5] - w[3] for w in l["words"] if len(w[0]) >= 2]
         hs.append(float(np.median(wh)) if wh else 0.0)
-    body_h = float(np.median([h for h in hs if h > 0])) if any(hs) else P
+    body_h = page_h or (float(np.median([h for h in hs if h > 0])) if any(hs) else P)
     items = []
     for i, l in enumerate(lines):
         lg, rg = l["box"][0] - left, right - l["box"][2]
@@ -832,6 +963,17 @@ def fix_quotes(words):
 _END = re.compile(r"[.!?:;»”“\")]$")
 
 
+def merge_framed(blocks):
+    """ერთი ჩარჩოს შიგნით მდგომი ბლოკები (ზედიზედ) ერთ ბლოკად."""
+    out = []
+    for b in blocks:
+        if out and b.get("frame") and out[-1].get("frame") == b["frame"]:
+            out[-1] = dict(out[-1], lines=out[-1]["lines"] + b["lines"])
+        else:
+            out.append(b)
+    return out
+
+
 def assemble_document(pages, lex):
     """გვერდები -> ტექსტი. აბზაცები სვეტიდან სვეტზე და გვერდიდან გვერდზე გრძელდება."""
     out_pages = []
@@ -839,13 +981,24 @@ def assemble_document(pages, lex):
     for pi, page in enumerate(pages):
         paras = []
         P = page["P"]
-        for b in page["blocks"]:
+        hs = [_line_height(l) for b in page["blocks"] for l in b["lines"]]
+        hs = [h for h in hs if h > 0]
+        page_h = float(np.median(hs)) if hs else None
+        for b in merge_framed(page["blocks"]):
             if b.get("header") and DROP_PAGE_HEADERS:
                 continue
             if KEEP_LINES:
                 paras.append(("para", [" ".join(line_tokens(l)) for l in b["lines"]]))
                 continue
-            for kind, lines in split_paragraphs(b, P):
+            if b.get("frame") and FRAME_AS_ONE_TEXT:
+                # ჩარჩოში ჩასმული ტექსტი - ერთ აბზაცად (სათაურიანად), გარე ტექსტს არ ებმის
+                lines = [l for _k, ls in split_paragraphs(b, P, page_h) for l in ls]
+                words = join_paragraph(lines, lex)
+                if words:
+                    paras.append(("para", words))
+                carry = None
+                continue
+            for kind, lines in split_paragraphs(b, P, page_h):
                 if kind == "head":
                     for l in lines:
                         l["at_margin"] = True       # სათაური შუაშია - დეფისის დაკარგვაც შესაძლებელია
@@ -901,7 +1054,7 @@ def save_debug(norm, blocks, vr, hr, path):
     th = max(1, norm.shape[1] // 600)
     for k, b in enumerate(blocks):
         x0, y0, x1, y1 = b["box"]
-        col = (160, 160, 160) if b.get("header") else (0, 0, 230)
+        col = (160, 160, 160) if b.get("header") else (200, 0, 200) if b.get("frame") else (0, 0, 230)
         cv2.rectangle(vis, (x0, y0), (x1, y1), col, 2 * th)
         for l in b["lines"]:
             lx0, ly0, lx1, ly1 = [int(v) for v in l["box"]]
@@ -996,6 +1149,12 @@ def write_pdf(p, pages, pnos, out_dir, freq):
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines(parts)
     os.replace(tmp, out_path)
+    if SPLIT_PAGES:
+        d = os.path.join(out_dir, base)
+        os.makedirs(d, exist_ok=True)
+        for pno, part in zip(pnos, parts):
+            with open(os.path.join(d, f"{base}_p{pno + 1:03d}.txt"), "w", encoding="utf-8") as f:
+                f.write(part.split("\n", 2)[2].strip() + "\n")
 
 
 _SETTING_NAMES = ["TESSERACT_CMD", "TESSDATA_DIR", "LANG", "WORDLIST", "QUALITY", "MIN_LINE_PITCH",
@@ -1028,6 +1187,7 @@ def check_tesseract():
 
 def main():
     global TESSERACT_CMD, TESSDATA_DIR, LANG, QUALITY, WORKERS, DROP_PAGE_HEADERS, MARK_HEADINGS, KEEP_LINES
+    global SPLIT_PAGES, FRAME_AS_ONE_TEXT
     ap = argparse.ArgumentParser(description="ძველი ქართული გაზეთების OCR, ვერსია 6")
     ap.add_argument("inputs", nargs="*", help="PDF ფაილები ან საქაღალდეები (ნაგულისხმევი: INPUT_PDF_FOLDER)")
     ap.add_argument("--out", default=OUTPUT_TXT_FOLDER)
@@ -1042,13 +1202,19 @@ def main():
     ap.add_argument("--keep-headers", action="store_true", help="გვერდის ზედა სტრიქონი ტექსტში დარჩეს")
     ap.add_argument("--mark-headings", action="store_true", default=MARK_HEADINGS)
     ap.add_argument("--lines", action="store_true", default=KEEP_LINES, help="სტრიქონები ცალ-ცალკე")
+    ap.add_argument("--split-pages", action="store_true", default=SPLIT_PAGES,
+                    help="თითოეული გვერდი ცალკე ფაილადაც")
+    ap.add_argument("--frame-paragraphs", action="store_true",
+                    help="ჩარჩოში ჩასმული ტექსტი აბზაცებად (და არა ერთ ტექსტად)")
     a = ap.parse_args()
     TESSERACT_CMD, TESSDATA_DIR, LANG, WORKERS = a.tesseract, a.tessdata, a.lang, a.workers
     if a.fast:
         QUALITY = "fast"
     if a.keep_headers:
         DROP_PAGE_HEADERS = False
-    MARK_HEADINGS, KEEP_LINES = a.mark_headings, a.lines
+    MARK_HEADINGS, KEEP_LINES, SPLIT_PAGES = a.mark_headings, a.lines, a.split_pages
+    if a.frame_paragraphs:
+        FRAME_AS_ONE_TEXT = False
     check_tesseract()
 
     pdfs = []
