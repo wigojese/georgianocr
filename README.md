@@ -12,8 +12,12 @@ Scored with `evaluate.py` against the hand-typed passages in `ground_truth/`:
 |---|---|---|---|
 | Guriis Erobis Moambe 1920 №1 p.1 (clean) | 9.5 % / 50.8 % | 37.9 % / 74.6 % | **1.7 % / 12.7 %** |
 | Guriis Erobis Moambe 1920 №6 p.2 (dark) | 4.6 % / 31.6 % | 32.6 % / 60.2 % | **0.4 % / 3.1 %** |
-| Sakartvelos Respublika 1920 №298 p.3 (broadsheet, high-res) | 31.7 % / 43.1 % | 64.5 % / 84.3 % | **2.4 % / 19.6 %** |
-| Sakartvelos Respublika 1921 №1 p.3 (broadsheet, low-res) | 6.4 % / 46.7 % | 5.6 % / 43.3 % | **3.2 % / 30.0 %** |
+| Sakartvelos Respublika 1920 №298 p.3 (broadsheet, high-res) | 31.7 % / 43.1 % | 64.5 % / 84.3 % | **3.7 % / 25.5 %** |
+| Sakartvelos Respublika 1921 №1 p.3 (broadsheet, low-res) | 6.4 % / 46.7 % | 5.6 % / 43.3 % | **5.2 % / 36.7 %** |
+| Saxalxo Saqme 1917 №100 p.2 (6 columns, very low-res, damaged type) | – | 68.7 % / 92.1 %* | **9.1 % / 57.9 %** |
+| Saxalxo Saqme 1917 №100 p.3 | – | 69.6 % / 93.3 %* | **14.3 % / 63.3 %** |
+
+\* the output you got from your previous script on this issue.
 
 Each cell is CER / WER: the share of characters / words that are wrong. The ground truth is small (about 2,500 characters), so add more pages to make these numbers more reliable (see below).
 
@@ -35,7 +39,14 @@ Each cell is CER / WER: the share of characters / words that are wrong. The grou
    The lexicon is `georgian_words.txt`: 197k word forms taken from Tesseract's `kat` model. Words that occur at least 3 times in your existing outputs are added to it, which picks up 1920s spellings such as `ერთიანათ` and `იმდენათ`.
 6. **Low-confidence text is kept.** Only decorative masthead lettering and isolated junk lines (stamps, ornaments) are dropped. The running page header is removed by default.
 7. **Decorative frames are ignored.** Ornamental borders and bands (crosses, checkerboards, flowers…) are found as long, narrow strips whose pattern repeats along their length. Ordinary text, including spaced-out display headings, does not repeat like that. The frame is erased before OCR and acts as a block boundary. Text inside a small framed box (an ad, a notice) is output as **one paragraph** (`--frame-paragraphs` keeps its normal paragraphs). Plain line frames are handled like column rules.
-8. **Paragraphs and headings.** Paragraphs are detected from indentation and short last lines. Headings are detected by larger letter height or centring, and appear as their own paragraph (`--mark-headings` prefixes them with `## `).
+8. **Dense newspapers with hairline column rules.** Some papers (e.g. *Saxalxo Saqme*) have six narrow columns. The gap between them is barely wider than a word space, the rules are faint and broken, and headings cover several columns, so no row of the page is empty. Column borders are found by `find_gutters`:
+   - It combines faint rule pieces found on the grey image with long white channels.
+   - It joins pieces lying on one (possibly slanted) vertical.
+   - It keeps a border only if text never crosses it along most of its length, which rejects accidental "rivers" between words.
+   - It drops a weaker border that lies closer than 0.6 of a column width to a stronger one.
+
+   These borders only separate blocks; nothing is erased from the image. Regions still spanning several columns are rebuilt bottom-up: lines are found inside the borders, consecutive lines of one column form a block, and blocks are ordered by column. Layout analysis works on word boxes rather than raw pixels, so specks and broken letters in a narrow gutter no longer glue columns together.
+9. **Paragraphs and headings.** Paragraphs are detected from indentation and short last lines. Headings are detected by larger letter height or centring, and appear as their own paragraph (`--mark-headings` prefixes them with `## `).
 
 ## Installation
 
@@ -90,4 +101,5 @@ Use this before and after every change. Without it, tuning is guesswork, and eac
 - **Fine-tuning `kat` on these newspapers** is the next big step. Use [tesstrain](https://github.com/tesseract-ocr/tesstrain) with a few hundred corrected text lines (line image + transcription). `--debug` and the line boxes give you the line crops, and correcting v6 output is much faster than typing from scratch.
 - **Mastheads and date bars** in decorative fonts come out garbled or are dropped.
 - **Tables** (e.g. tariff tables with dotted leaders) are read column by column: all the item names, then all the prices.
+- **Very low-resolution scans** such as *Saxalxo Saqme* (1200 px wide for a 6-column page, so body letters are about 8 px tall) stay hard even with correct layout. About 1 word in 10 is cut by damaged type, so WER stays high. A higher-resolution scan or a fine-tuned model would help most here.
 - **Line spacing and resolution.** Scans whose line spacing falls between 18 and 72 px are processed at native resolution. Others are rescaled to 28 px line spacing. The spacing estimate is checked against letter height, so ornaments and sparse poems no longer distort it.
