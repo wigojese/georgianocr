@@ -21,6 +21,17 @@ Scored with `evaluate.py` against the hand-typed passages in `ground_truth/`:
 
 Each cell is CER / WER: the share of characters / words that are wrong. The ground truth is small (about 2,500 characters), so add more pages to make these numbers more reliable (see below).
 
+## Page layout: one block per column
+
+By default (`--layout grid`) a page is divided the way a reader sees it:
+
+- **Masthead** (newspaper name, date, price line, front-page summary) goes into its own section at the start of the page, marked `[სათაური]`, followed by `[ტექსტი]`. Use `--no-masthead` to leave it out.
+- **Sections** are separated by rules that run almost across the full page.
+- **Each column of a section is one long block.** It is cut only where a rule crosses the column or something spanning several columns (a heading, a ruled box, an ad) interrupts it. Articles in the same column are not chopped into separate pieces; paragraphs keep them apart in the text.
+- Very tall blocks are read by Tesseract in chunks of about 30 lines (it mixes up lines on very tall images), but they stay one block in the output.
+
+`--layout xycut` brings back the older fine-grained split.
+
 ## What v6 does differently, and why
 
 1. **Column layout instead of blob merging.** v2–v5 built blocks by smearing ink and gluing pieces. In justified text the gaps between words are as wide as the gaps between columns, so a column got cut into vertical strips and lines were read out of order. That is where most of their 35–60 % error came from. v6 uses a recursive XY-cut:
