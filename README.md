@@ -94,6 +94,14 @@ Output is always split by page: each page starts with `===== გვერდი 
 
 Speed: about 12 s per journal page per CPU core in the default (best) mode, and about 25–40 s per broadsheet page. 68 journal pages took 3.5 minutes on 4 cores.
 
+## Long batch runs
+
+- **Stuck page.** A page that takes longer than `PAGE_TIMEOUT` (20 min) is marked `[OCR შეცდომა: ...]` in the output, the workers are restarted, and the run continues. A single Tesseract call is limited to `TESS_TIMEOUT` (3 min).
+- **Crashed worker** (usually out of memory). The pages that were in progress are re-run one at a time. Only the page that crashes again is marked as an error.
+- **Progress.** A progress line is printed every 5 minutes.
+- **Interrupted run.** Run the same command again. Finished PDFs are skipped, because `SKIP_EXISTING` is on.
+- **Memory.** A large scan (about 4000×6000 px) needs about 1.5 GB per worker. The default is at most 4 workers. With 8 GB RAM use `--workers 3`. If you run more workers than fit in memory, Windows starts swapping and the run appears to hang.
+
 ## Measuring quality: `evaluate.py`
 
 1. Type up 2–3 paragraphs from a page, exactly as printed, and save them as `ground_truth/<pdf name>_p<page>.txt`, e.g. `Guriis_Erobis_Moambe_1920_N1_p001.txt`. Put each passage on its own line; passages can come from anywhere on the page. Include hard pages: bold type, dark scans, small print.

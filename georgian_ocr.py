@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 # ============================ პარამეტრები ============================
 
@@ -77,14 +77,23 @@ SPLIT_PAGES = False
 KEEP_LINES = False
 
 DEBUG_IMAGES = False    # დაჭრის სქემა: extracted_texts/_debug/
+# Tesseract-ის ერთი გამოძახების მაქს. ხანგრძლივობა (წმ) და ერთი გვერდის მაქს. ხანგრძლივობა (წმ).
+# თუ გვერდი ამაზე დიდხანს მუშავდება (გაიჭედა), პროცესი ჩერდება და გვერდი შეცდომით აღინიშნება
+TESS_TIMEOUT = 180
+PAGE_TIMEOUT = 1200
 SKIP_EXISTING = True    # უკვე დამუშავებულ PDF-ებს გამოტოვებს
-WORKERS = max(1, (os.cpu_count() or 2) - 1)   # რამდენი გვერდი ერთდროულად
+# რამდენი გვერდი ერთდროულად. დიდ სკანზე (4000x6000) ერთი გვერდი ~1.5 GB მეხსიერებას იყენებს:
+# 8 GB RAM -> 3, 16 GB -> 6. მეტი პროცესი, ვიდრე მეხსიერება იტევს, კომპიუტერს "აჭედებს".
+WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 
 # =====================================================================
 
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")  # Tesseract-ის ნაკადები ერთმანეთს არ უნდა შეეჯახოს
 
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF (ახალი სახელი)
+except ImportError:
+    import fitz
 import cv2
 import numpy as np
 import pytesseract
@@ -713,7 +722,11 @@ def ocr_lines(img, psm, ox, oy, scale):
     """Tesseract -> სტრიქონები [{text, words:[(text,conf,x0,y0,x1,y1)], box}] გვერდის კოორდინატებში."""
     pad = 20
     img = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
-    d = pytesseract.image_to_data(img, lang=LANG, config=tess_config(psm), output_type=pytesseract.Output.DICT)
+    try:
+        d = pytesseract.image_to_data(img, lang=LANG, config=tess_config(psm),
+                                      output_type=pytesseract.Output.DICT, timeout=TESS_TIMEOUT)
+    except RuntimeError:                          # Tesseract გაიჭედა - ეს ნაწილი გამოტოვდება
+        return []
     lines, cur, key = [], [], None
     for i, txt in enumerate(d["text"]):
         k = (d["block_num"][i], d["par_num"][i], d["line_num"][i])
@@ -1745,7 +1758,32 @@ def parse_pages(spec, n):
     return out
 
 
+def _new_pool():
+    kw = dict(max_workers=WORKERS, initializer=_init_worker, initargs=(_settings(),))
+    if sys.version_info >= (3, 11):
+        # პროცესი 20 გვერდის შემდეგ ახლით იცვლება - მეხსიერება არ გროვდება
+        import multiprocessing as mp
+        kw.update(max_tasks_per_child=20, mp_context=mp.get_context("spawn"))
+    return ProcessPoolExecutor(**kw)
+
+
+def _kill_pool(ex):
+    """გაჭედილი პროცესების იძულებითი გაჩერება (ProcessPoolExecutor-ს ამის საშუალება არ აქვს)."""
+    for pr in list(getattr(ex, "_processes", {}).values()):
+        try:
+            pr.terminate()
+        except Exception:
+            pass
+    try:
+        ex.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
 def run(pdfs, out_dir, pages_spec=None, debug=False):
+    """გვერდები პარალელურად. ზედამხედველი: რიგში ერთდროულად მხოლოდ რამდენიმე გვერდია; თუ
+    გვერდი PAGE_TIMEOUT-ზე დიდხანს მუშავდება ან პროცესი მოკვდა (მეხსიერება), პროცესები
+    თავიდან იქმნება და დანარჩენი გვერდები გრძელდება - პროგრამა აღარ "ჩერდება"."""
     os.makedirs(out_dir, exist_ok=True)
     debug_dir = os.path.join(out_dir, "_debug") if debug else None
     if debug_dir:
@@ -1754,28 +1792,91 @@ def run(pdfs, out_dir, pages_spec=None, debug=False):
     if not lexicon():
         print(f"გაფრთხილება: {WORDLIST} ვერ მოიძებნა - გაწყვეტილი სიტყვები მხოლოდ დეფისით აღდგება.")
 
-    jobs, counts = [], {}
+    from collections import deque
+    from concurrent.futures import wait, FIRST_COMPLETED
+    from concurrent.futures.process import BrokenProcessPool
+
+    counts, todo = {}, deque()
     for p in pdfs:
-        n = len(fitz.open(p))
-        pg = parse_pages(pages_spec, n)
-        counts[p] = pg
-        jobs += [(p, i, debug_dir) for i in pg]
-    results = {}
+        try:
+            with fitz.open(p) as d:
+                n = len(d)
+        except Exception as e:
+            print(f"   შეცდომა: {os.path.basename(p)} ვერ გაიხსნა: {e}", flush=True)
+            continue
+        counts[p] = parse_pages(pages_spec, n)
+        todo += [(p, i, debug_dir) for i in counts[p]]
+    results, done = {}, {p: 0 for p in counts}
     t0 = time.time()
-    done = {p: 0 for p in pdfs}
-    with ProcessPoolExecutor(max_workers=WORKERS, initializer=_init_worker, initargs=(_settings(),)) as ex:
-        futs = {ex.submit(process_page, j): j for j in jobs}
-        for fut in as_completed(futs):
-            p, i, _ = futs[fut]
+    ex = _new_pool()
+    inflight = {}                  # future -> (job, დაწყების დრო ან None)
+
+    def finish(job, res):
+        p, i, _ = job
+        results[(p, i)] = res
+        done[p] += 1
+        if done[p] == len(counts[p]):
             try:
-                results[(p, i)] = fut.result()
-            except Exception as e:
-                print(f"   შეცდომა: {os.path.basename(p)} გვერდი {i + 1}: {e}", flush=True)
-                results[(p, i)] = dict(blocks=[], P=30.0, size=(0, 0), error=str(e))
-            done[p] += 1
-            if done[p] == len(counts[p]):
                 write_pdf(p, [results.pop((p, k)) for k in counts[p]], counts[p], out_dir, freq)
                 print(f"-> მზადაა: {os.path.basename(p)} ({time.time() - t0:.0f} წმ)", flush=True)
+            except Exception as e:
+                print(f"   შეცდომა: {os.path.basename(p)} ჩაწერისას: {e}", flush=True)
+
+    def failed(job, msg):
+        print(f"   შეცდომა: {os.path.basename(job[0])} გვერდი {job[1] + 1}: {msg}", flush=True)
+        finish(job, dict(blocks=[], P=30.0, size=(0, 0), error=msg))
+
+    # პროცესის კრახისას ვერ ვიგებთ, რომელმა გვერდმა გამოიწვია - იმ მომენტში დამუშავებული
+    # გვერდები თავიდან ცალ-ცალკე ("მარტო") მუშავდება; მარტოს კრახი = ეს გვერდი არის მიზეზი
+    suspects = set()
+    last_beat = time.time()
+    while todo or inflight:
+        while todo and len(inflight) < 2 * WORKERS:
+            solo_running = any(rec[0] in suspects for rec in inflight.values())
+            if solo_running or (todo[0] in suspects and inflight):
+                break
+            job = todo.popleft()
+            inflight[ex.submit(process_page, job)] = [job, None]
+            if job in suspects:
+                break
+        fin, _ = wait(list(inflight), timeout=15, return_when=FIRST_COMPLETED)
+        if time.time() - last_beat > 300:
+            last_beat = time.time()
+            left = len(todo) + len(inflight)
+            print(f"   ... მუშავდება, დარჩა {left} გვერდი ({time.time() - t0:.0f} წმ)", flush=True)
+        broken = False
+        for f in fin:
+            job, _st = inflight.pop(f)
+            try:
+                finish(job, f.result())
+            except BrokenProcessPool:
+                broken = True
+                if job in suspects:
+                    failed(job, "პროცესი შეწყდა (მეხსიერება?)")
+                else:
+                    suspects.add(job)
+                    todo.appendleft(job)
+            except Exception as e:
+                failed(job, str(e))
+        now = time.time()
+        stuck = []
+        for f, rec in inflight.items():
+            if rec[1] is None and f.running():
+                rec[1] = now
+            if rec[1] is not None and now - rec[1] > PAGE_TIMEOUT:
+                stuck.append(f)
+        if stuck or broken:
+            for f in stuck:
+                job, _st = inflight.pop(f)
+                failed(job, f"დრო ამოიწურა ({PAGE_TIMEOUT} წმ)")
+            # დანარჩენი დაუსრულებელი გვერდები თავიდან რიგში
+            for f, (job, _st) in list(inflight.items()):
+                todo.appendleft(job)
+            inflight.clear()
+            _kill_pool(ex)
+            ex = _new_pool()
+            print("   (პროცესები თავიდან გაეშვა)", flush=True)
+    ex.shutdown(wait=True)
 
 
 def write_pdf(p, pages, pnos, out_dir, freq):
@@ -1799,7 +1900,7 @@ def write_pdf(p, pages, pnos, out_dir, freq):
                 f.write(part.split("\n", 2)[2].strip() + "\n")
 
 
-_SETTING_NAMES = ["TESSERACT_CMD", "TESSDATA_DIR", "LANG", "WORDLIST", "QUALITY", "LAYOUT", "MASTHEAD", "MIN_LINE_PITCH",
+_SETTING_NAMES = ["TESSERACT_CMD", "TESSDATA_DIR", "LANG", "WORDLIST", "QUALITY", "TESS_TIMEOUT", "LAYOUT", "MASTHEAD", "MIN_LINE_PITCH",
                   "MAX_LINE_PITCH", "TARGET_LINE_PITCH"]
 
 
